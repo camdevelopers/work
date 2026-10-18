@@ -190,20 +190,24 @@ export function applyEventRow(fields) {
 
   // checkin → insert into attendance
   if (action === 'checkin') {
-    db.run(
-      `INSERT OR IGNORE INTO attendance (date, user, checkin, checkout) VALUES (?,?,?,NULL)`,
-      [ts.slice(0, 10), user, ts.slice(11, 19)]
-    );
-  }
+  const d = new Date(ts);
+  const localDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const localTime = d.toTimeString().slice(0, 8);
+  db.run(
+    `INSERT OR IGNORE INTO attendance (date, user, checkin, checkout) VALUES (?,?,?,NULL)`,
+    [localDate, user, localTime]
+  );
+}
 
-  // checkout → update attendance
-  if (action === 'checkout') {
-    db.run(
-      `UPDATE attendance SET checkout = ? WHERE date = ? AND user = ?`,
-      [ts.slice(11, 19), ts.slice(0, 10), user]
-    );
-  }
-
+if (action === 'checkout') {
+  const d = new Date(ts);
+  const localDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+  const localTime = d.toTimeString().slice(0, 8);
+  db.run(
+    `UPDATE attendance SET checkout = ? WHERE date = ? AND user = ?`,
+    [localTime, localDate, user]
+  );
+}   
   // unavailable → insert into leave
   if (action === 'unavailable') {
     // note format: "type:leave 2026-10-20→2026-10-24 reason"
