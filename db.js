@@ -1,5 +1,3 @@
-//import initSqlJs from 'https://sql.js.org/dist/sql-wasm.js';
-
 const IDB_NAME = 'office-pwa';
 const IDB_STORE = 'state';
 const DB_KEY = 'sqlite_blob';
@@ -45,14 +43,13 @@ async function idbSet(key, value) {
 // --- DB init ---
 export async function initDB() {
   SQL = await initSqlJs({
-  locateFile: () => 'https://sql.js.org/dist/sql-wasm.wasm'
-});
+    locateFile: () => 'https://sql.js.org/dist/sql-wasm.wasm'
+  });
 
   const savedBlob = await idbGet(DB_KEY);
   if (savedBlob) {
     db = new SQL.Database(new Uint8Array(savedBlob));
   } else {
-    // First run — create schema
     db = new SQL.Database();
     db.run(`
       CREATE TABLE IF NOT EXISTS tasks (
@@ -91,7 +88,8 @@ export async function initDB() {
         user TEXT,
         checkin TEXT,
         checkout TEXT,
-        PRIMARY KEY(date, user)
+        seq INTEGER DEFAULT 1,
+        PRIMARY KEY(date, user, seq)
       );
       CREATE TABLE IF NOT EXISTS leave (
         user TEXT,
@@ -113,14 +111,14 @@ export async function initDB() {
         ts TEXT,
         user TEXT
       );
+      CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        role TEXT DEFAULT 'employee'
+      );
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT
       );
-      CREATE TABLE IF NOT EXISTS users (
-      username TEXT PRIMARY KEY,
-      role TEXT DEFAULT 'employee'
-    );   
     `);
     await saveDB();
   }
@@ -188,36 +186,41 @@ export function applyEventRow(fields) {
     );
   }
 
-  // checkin → insert into attendance
-  if (action === 'checkin') {
-  const d = new Date(ts);
-  const localDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  const localTime = d.toTimeString().slice(0, 8);
-  db.run(
-    `INSERT OR IGNORE INTO attendance (date, user, checkin, checkout) VALUES (?,?,?,NULL)`,
-    [localDate, user, localTime]
-  );
-}
+  // checkin / recheckin → insert new attendance row
+  if (action === 'checkin' || action === 'recheckin') {
+    const d = new Date(ts);
+    const localDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const localTime = d.toTimeString().slice(0, 8);
+    const maxSeq = db.exec(
+      `SELECT COALESCE(MAX(seq), 0) + 1 FROM attendance WHERE date = ? AND user = ?`,
+      [localDate, user]
+    );
+    const seq = maxSeq.length > 0 ? maxSeq[0].values[0][0] : 1;
+    db.run(
+      `INSERT INTO attendance (date, user, checkin, checkout, seq) VALUES (?,?,?,NULL,?)`,
+      [localDate, user, localTime, seq]
+    );
+  }
 
-if (action === 'checkout') {
-  const d = new Date(ts);
-  const localDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
-  const localTime = d.toTimeString().slice(0, 8);
-  db.run(
-    `UPDATE attendance SET checkout = ? WHERE date = ? AND user = ?`,
-    [localTime, localDate, user]
-  );
-}   
+  // checkout → update latest attendance row
+  if (action === 'checkout') {
+    const d = new Date(ts);
+    const localDate = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    const localTime = d.toTimeString().slice(0, 8);
+    db.run(
+      `UPDATE attendance SET checkout = ? WHERE date = ? AND user = ? AND seq = (SELECT MAX(seq) FROM attendance WHERE date = ? AND user = ?)`,
+      [localTime, localDate, user, localDate, user]
+    );
+  }
+
   // unavailable → insert into leave
   if (action === 'unavailable') {
-    // note format: "type:leave 2026-10-20→2026-10-24 reason"
     const parts = (note || '').split(' ');
     const type = (parts[0] || 'leave').replace('type:', '');
     const dates = (parts[1] || '').split('→');
     const start = dates[0] || ts.slice(0, 10);
     const end = dates[1] && dates[1] !== 'open' ? dates[1] : null;
     const reason = parts.slice(2).join(' ') || null;
-
     db.run(
       `INSERT OR IGNORE INTO leave (user, start_date, end_date, type, reason) VALUES (?,?,?,?,?)`,
       [user, start, end, type, reason]
@@ -232,30 +235,31 @@ if (action === 'checkout') {
     );
   }
 
-  // created → insert task definition (from tasks/ directory pull)
-if (action === 'created') {
-  // note format: "name|type|recurrence|assigned|exempt|grace|showAll|trackTime"
-  const parts = (note || '').split('|');
-  const [name, type, recurrence, assigned, exempt, grace, showAll, trackTime] = parts;
-  db.run(
-    `INSERT OR IGNORE INTO tasks (task_id, name, type, recurrence, assigned_user, exempt_days, grace_min, show_all_instances, track_time, retired, created_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-    [task_id, name || task_id, type || 'standalone', recurrence || 'none', assigned || '', exempt || '', parseInt(grace) || 0, parseInt(showAll) || 1, parseInt(trackTime) || 0, 0, ts]
-  );
-}
+  // created → insert task definition
+  if (action === 'created') {
+    const parts = (note || '').split('|');
+    const [name, type, recurrence, assigned, exempt, grace, showAll, trackTime] = parts;
+    db.run(
+      `INSERT OR IGNORE INTO tasks (task_id, name, type, recurrence, assigned_user, exempt_days, grace_min, show_all_instances, track_time, retired, created_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [task_id, name || task_id, type || 'standalone', recurrence || 'none', assigned || '', exempt || '', parseInt(grace) || 0, parseInt(showAll) || 1, parseInt(trackTime) || 0, 0, ts]
+    );
+  }
 
+  // consume / restock → insert into stock
   if (action === 'consume' || action === 'restock') {
-  const qty = parseInt(note) || 0;
-  db.run(
-    `INSERT INTO stock (task_id, event, qty, ts, user) VALUES (?,?,?,?,?)`,
-    [task_id, action, qty, ts, user]
-  );
-}   
+    const qty = parseInt(note) || 0;
+    db.run(
+      `INSERT INTO stock (task_id, event, qty, ts, user) VALUES (?,?,?,?,?)`,
+      [task_id, action, qty, ts, user]
+    );
+  }
 
+  // retired / resumed
   if (action === 'retired') {
-  db.run(`UPDATE tasks SET retired = 1 WHERE task_id = ?`, [task_id]);
-}
-if (action === 'resumed') {
-  db.run(`UPDATE tasks SET retired = 0 WHERE task_id = ?`, [task_id]);
-}   
+    db.run(`UPDATE tasks SET retired = 1 WHERE task_id = ?`, [task_id]);
+  }
+  if (action === 'resumed') {
+    db.run(`UPDATE tasks SET retired = 0 WHERE task_id = ?`, [task_id]);
+  }
 }   
