@@ -1,9 +1,8 @@
 import { getDB, saveDB } from './db.js';
 import { getNextInstance, getLastCompleted, isMissed } from './instances.js';
 import { renderTaskCard, getDoer, getLatestStatus, getTransferredTo } from './actions.js';
-//import { renderStockBar } from './stock-display.js';
+import { getStock, renderStockBar } from './stock-display.js';
 import { renderDuration, renderLeaveBadge } from './polish.js';
-import { getStock, renderStockBar } from './stock-display.js';   
 
 // --- Toggle collapse ---
 window.toggleSec = function(headerEl) {
@@ -47,24 +46,37 @@ function renderAttendance(currentUser) {
   const db = getDB();
   const today = new Date().toISOString().slice(0, 10);
 
-  const res = db.exec(`SELECT checkin, checkout FROM attendance WHERE date = ? AND user = ?`, [today, currentUser]);
-  let checkin = null, checkout = null;
-  if (res.length > 0 && res[0].values.length > 0) {
-    checkin = res[0].values[0][0];
-    checkout = res[0].values[0][1];
-  }
+  const res = db.exec(
+    `SELECT checkin, checkout, seq FROM attendance WHERE date = ? AND user = ? ORDER BY seq ASC`,
+    [today, currentUser]
+  );
 
   const fmt = (t) => t ? new Date(`2000-01-01T${t}`).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : '—';
 
+  let rows = '';
+  let latestCheckin = null, latestCheckout = null;
+
+  if (res.length > 0) {
+    res[0].values.forEach(v => {
+      const [checkin, checkout, seq] = v;
+      latestCheckin = checkin;
+      latestCheckout = checkout;
+      rows += `<div class="att-entry">
+        <span class="muted small">#${seq}</span>
+        <span>In: <strong>${fmt(checkin)}</strong></span>
+        <span>Out: <strong>${fmt(checkout)}</strong></span>
+      </div>`;
+    });
+  }
+
   container.innerHTML = `
-    <div class="attendance-row">
-      <span>Check-in: <strong>${fmt(checkin)}</strong></span>
-      <span>Check-out: <strong>${fmt(checkout)}</strong></span>
-    </div>
+    <div class="attendance-entries">${rows || '<p class="muted">No entries today.</p>'}</div>
     <div class="attendance-btns">
-      ${!checkin ? '<button class="btn-checkin" onclick="doAttendance(\'checkin\')">Check In</button>' : ''}
-      ${checkin && !checkout ? '<button class="btn-checkout" onclick="doAttendance(\'checkout\')">Check Out</button>' : ''}
-      ${checkin && checkout ? '<span class="muted">Done for today</span>' : ''}
+      ${!latestCheckin ? '<button class="btn-checkin" onclick="doAttendance(\'checkin\')">Check In</button>' : ''}
+      ${latestCheckin && !latestCheckout ? '<button class="btn-checkout" onclick="doAttendance(\'checkout\')">Check Out</button>' : ''}
+      ${latestCheckin && latestCheckout ? `
+        <button class="btn-checkin" onclick="doAttendance(\'recheckin\')">Re-check In</button>
+      ` : ''}
     </div>
   `;
 }
@@ -75,10 +87,18 @@ window.doAttendance = async function(type) {
   const now = new Date().toTimeString().slice(0, 8);
   const today = new Date().toISOString().slice(0, 10);
 
-  if (type === 'checkin') {
-    db.run(`INSERT OR REPLACE INTO attendance (date, user, checkin, checkout) VALUES (?, ?, ?, NULL)`, [today, user, now]);
+  if (type === 'checkin' || type === 'recheckin') {
+    const maxSeq = db.exec(
+      `SELECT COALESCE(MAX(seq), 0) + 1 FROM attendance WHERE date = ? AND user = ?`,
+      [today, user]
+    );
+    const seq = maxSeq.length > 0 ? maxSeq[0].values[0][0] : 1;
+    db.run(`INSERT INTO attendance (date, user, checkin, checkout, seq) VALUES (?,?,?,NULL,?)`, [today, user, now, seq]);
   } else {
-    db.run(`UPDATE attendance SET checkout = ? WHERE date = ? AND user = ?`, [now, today, user]);
+    db.run(
+      `UPDATE attendance SET checkout = ? WHERE date = ? AND user = ? AND seq = (SELECT MAX(seq) FROM attendance WHERE date = ? AND user = ?)`,
+      [now, today, user, today, user]
+    );
   }
   await saveDB();
 
@@ -93,7 +113,7 @@ function renderPresence() {
   const db = getDB();
   const today = new Date().toISOString().slice(0, 10);
 
-  const attRes = db.exec(`SELECT user, checkin, checkout FROM attendance WHERE date = ?`, [today]);
+  const attRes = db.exec(`SELECT user, checkin, checkout, seq FROM attendance WHERE date = ? ORDER BY seq DESC`, [today]);
   const leaveRes = db.exec(`SELECT user, type FROM leave WHERE start_date <= ? AND (end_date IS NULL OR end_date >= ?)`, [today, today]);
 
   const fmt = (t) => t ? new Date(`2000-01-01T${t}`).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : '';
@@ -102,8 +122,13 @@ function renderPresence() {
   if (attRes.length > 0) attRes[0].values.forEach(v => users.add(v[0]));
   if (leaveRes.length > 0) leaveRes[0].values.forEach(v => users.add(v[0]));
 
+  // Only show latest entry per user
   const attMap = {};
-  if (attRes.length > 0) attRes[0].values.forEach(v => { attMap[v[0]] = { checkin: v[1], checkout: v[2] }; });
+  if (attRes.length > 0) {
+    attRes[0].values.forEach(v => {
+      if (!attMap[v[0]]) attMap[v[0]] = { checkin: v[1], checkout: v[2] };
+    });
+  }
   const leaveMap = {};
   if (leaveRes.length > 0) leaveRes[0].values.forEach(v => { leaveMap[v[0]] = v[1]; });
 
@@ -132,6 +157,7 @@ function renderMissed(tasks) {
     if (inst && isMissed(inst, task)) {
       const card = renderTaskCard(inst, task);
       card.classList.add('card-missed');
+      decorateCard(card, inst, task);
       container.appendChild(card);
       count++;
     }
@@ -167,7 +193,7 @@ function renderCurrentTasks(tasks) {
     // All other types: show next pending instance
     const inst = getNextInstance(task);
     if (!inst) continue;
-    if (isMissed(inst, task)) continue; // shown in Missed section
+    if (isMissed(inst, task)) continue;
 
     const card = renderTaskCard(inst, task);
     decorateCard(card, inst, task);
@@ -176,7 +202,8 @@ function renderCurrentTasks(tasks) {
   }
 
   if (count === 0) container.innerHTML = '<p class="muted">Nothing to do right now.</p>';
-}   
+}
+
 // --- Section 5: Completed (one card per task, last done) ---
 function renderCompleted(tasks) {
   const container = document.getElementById('completed-content');
